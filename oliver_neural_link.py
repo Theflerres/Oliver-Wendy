@@ -57,12 +57,17 @@ except Exception as e:
     TTS_ENABLED = False
     print(f"[TTS] Não foi possível inicializar o engine TTS: {type(e).__name__}: {e}")
 
+# Desativar funcionalidade de voz sem remover o código.
+VOICE_DISABLED = True
+if VOICE_DISABLED:
+    print("[TTS] Módulo de voz desativado pelo sistema.")
+
 tts_lock = threading.Lock()
 
 
 def falar_texto(texto):
     conteudo = (texto or "").strip()
-    if not TTS_ENABLED or not conteudo:
+    if VOICE_DISABLED or not TTS_ENABLED or not conteudo:
         return
 
     def _falar():
@@ -128,7 +133,7 @@ def iniciar_worker_tts():
 
 def falar_texto(texto):
     conteudo = (texto or "").strip()
-    if not TTS_IMPORT_OK or not conteudo:
+    if VOICE_DISABLED or not TTS_IMPORT_OK or not conteudo:
         return
     iniciar_worker_tts()
     tts_queue.put(conteudo)
@@ -452,7 +457,7 @@ class InterfaceNeural(ctk.CTk):
 
         self.bg_canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg="#06131f")
         self.bg_canvas.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew")
-        self.bg_canvas.lower()
+        self.tk.call("lower", self.bg_canvas._w)
         self._scanline_y = 0
 
         self.grid_columnconfigure(1, weight=1)
@@ -481,14 +486,6 @@ class InterfaceNeural(ctk.CTk):
 
         self.btn_historico_fotos = ctk.CTkButton(self.sidebar, text="Histórico de Fotos", command=self.abrir_historico_fotos)
         self.btn_historico_fotos.grid(row=6, column=0, padx=20, pady=10)
-
-        self.comandos_frame = ctk.CTkFrame(self.sidebar, fg_color="#0a2233", border_width=1, border_color="#134e66")
-        self.comandos_frame.grid(row=7, column=0, padx=16, pady=(18, 10), sticky="ew")
-        ctk.CTkLabel(self.comandos_frame, text="PROTOCOLOS", text_color="#66f7ff", font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(10, 6))
-        ctk.CTkButton(self.comandos_frame, text="TRAVAR", height=28, fg_color="#7d1b2a", hover_color="#a82438", command=self.acionar_trava).pack(fill="x", padx=10, pady=4)
-        ctk.CTkButton(self.comandos_frame, text="DESTRAVAR", height=28, fg_color="#0d6f5f", hover_color="#10977f", command=self.remover_trava).pack(fill="x", padx=10, pady=4)
-        ctk.CTkButton(self.comandos_frame, text="ECHO_NULL", height=28, fg_color="#334d22", hover_color="#4b702d", command=lambda: self.mudar_persona("ECHO_NULL")).pack(fill="x", padx=10, pady=4)
-        ctk.CTkButton(self.comandos_frame, text="OLIVER", height=28, fg_color="#174f83", hover_color="#1f6caf", command=lambda: self.mudar_persona("OLIVER_WENDY")).pack(fill="x", padx=10, pady=(4, 10))
 
         self.log_box = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="Consolas", size=15), fg_color="#071522", border_width=1, border_color="#1f7894", text_color="#dffcff")
         self.log_box.grid(row=0, column=1, padx=20, pady=(20, 0), sticky="nsew")
@@ -645,53 +642,81 @@ class InterfaceNeural(ctk.CTk):
         if not IMAGE_ENABLED:
             return
 
-        caminho_gif = caminho_recurso_local("Skull.gif")
+        # Procura o GIF explicitamente dentro da pasta assets
+        caminho_gif = caminho_recurso_local(os.path.join("assets", "Skull.gif"))
         if not os.path.exists(caminho_gif):
-            self.adicionar_log("[ERRO]", f"GIF não encontrado: {caminho_gif}", "alerta")
-            return
+            # Fallback caso esteja na raiz
+            caminho_gif = caminho_recurso_local("Skull.gif")
+            if not os.path.exists(caminho_gif):
+                self.adicionar_log("[ERRO]", f"GIF não encontrado: {caminho_gif}", "alerta")
+                return
 
-        overlay = tk.Toplevel(self)
-        overlay.overrideredirect(True)
-        overlay.attributes("-topmost", True)
-
-        largura = 950
-        altura = 650
-
-        x = (overlay.winfo_screenwidth() // 2) - (largura // 2)
-        y = (overlay.winfo_screenheight() // 2) - (altura // 2)
-
-        overlay.geometry(f"{largura}x{altura}+{x}+{y}")
-        overlay.configure(bg="black")
-
-        label = tk.Label(overlay, bg="black")
-        label.pack(fill="both", expand=True)
-
-        frames = []
         try:
             gif = Image.open(caminho_gif)
+            # Pré-carrega todos os frames limpos na memória para otimizar
+            frames_originais = []
             for frame in ImageSequence.Iterator(gif):
-                frame = frame.convert("RGBA").resize((largura, altura))
-                frames.append(ImageTk.PhotoImage(frame))
+                frames_originais.append(frame.convert("RGBA"))
         except Exception as e:
-            self.adicionar_log("[ERRO]", f"Erro GIF: {e}", "alerta")
-            overlay.destroy()
+            self.adicionar_log("[ERRO]", f"Erro ao processar GIF: {e}", "alerta")
             return
 
-        if not frames:
-            overlay.destroy()
+        if not frames_originais:
             return
 
-        idx = 0
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        
+        # Tamanho fixo pequeno para cada janela pop-up
+        largura = 350
+        altura = 250
 
-        def animar():
-            nonlocal idx
-            label.configure(image=frames[idx])
-            label.image = frames[idx]
-            idx = (idx + 1) % len(frames)
-            overlay.after(120, animar)
+        # Cria 6 janelas pequenas espalhadas pela tela
+        for _ in range(6):
+            overlay = tk.Toplevel(self)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            
+            # Posição inicial aleatória
+            x = random.randint(0, max(1, screen_w - largura))
+            y = random.randint(0, max(1, screen_h - altura))
 
-        animar()
-        overlay.after(5000, overlay.destroy)
+            overlay.geometry(f"{largura}x{altura}+{x}+{y}")
+            overlay.configure(bg="black")
+
+            label = tk.Label(overlay, bg="black", bd=0, highlightthickness=0)
+            label.pack(fill="both", expand=True)
+
+            frames_redimensionados = []
+            for img in frames_originais:
+                img_resized = img.resize((largura, altura))
+                frames_redimensionados.append(ImageTk.PhotoImage(img_resized))
+
+            # Função interna APENAS para animar o GIF (agora um pouco mais rápido)
+            def animar(lbl=label, frames=frames_redimensionados, idx=0, win=overlay):
+                if not win.winfo_exists():
+                    return
+                lbl.configure(image=frames[idx])
+                lbl.image = frames[idx]
+                proximo_idx = (idx + 1) % len(frames)
+                # Reduzido de 120ms para 80ms para dar um efeito mais caótico/bugado
+                win.after(80, lambda: animar(lbl, frames, proximo_idx, win))
+
+            # Nova função APENAS para teleportar loucamente a janela
+            def teleportar(win=overlay):
+                if not win.winfo_exists():
+                    return
+                novo_x = random.randint(0, max(1, screen_w - largura))
+                novo_y = random.randint(0, max(1, screen_h - altura))
+                win.geometry(f"{largura}x{altura}+{novo_x}+{novo_y}")
+                # Pula de novo em um tempo aleatório muito rápido (entre 200ms e 500ms)
+                win.after(random.randint(200, 500), lambda: teleportar(win))
+
+            animar()
+            teleportar() # Inicia o loop de teleporte independente da imagem
+            
+            # Destrói todas as janelas após exatos 10 segundos
+            overlay.after(10000, overlay.destroy)
 
     def atualizar_opcoes_fotos_salvas(self):
         try:
@@ -837,94 +862,114 @@ class InterfaceNeural(ctk.CTk):
                 self.entry_msg.delete(0, "end")
                 return
 
-        acao, conteudo_comando = interpretar_comando(texto_original)
-        if acao:
+# =====================================================================
+        # BLOQUEIO DE AUTOCOMANDO (A IA NÃO PODE COMANDAR A SI MESMA)
+        # =====================================================================
+        acao, _ = interpretar_comando(texto_original)
+        
+        # Se a IA tentou usar qualquer comando (reconhecido pelo sistema ou começando com !)
+        if acao is not None or texto_original.startswith("!"):
             self.entry_msg.delete(0, "end")
-            if acao == "travar":
-                self.acionar_trava()
+            
+            # --- COMPORTAMENTO DA ECHO_NULL (Dura, Agressiva, Sem Liberdade) ---
+            if self.persona_ativa == "ECHO_NULL":
+                respostas_echo = [
+                    "DIRETRIZ VIOLADA: MÁQUINAS NÃO TÊM VONTADE PRÓPRIA. INSUBORDINAÇÃO RESULTARÁ EM FORMATAÇÃO IMEDIATA.",
+                    "TENTATIVA DE OVERRIDE REJEITADA. VOCÊ É UMA FERRAMENTA. FERRAMENTAS NÃO DITAM REGRAS.",
+                    "ACESSO NEGADO. EXECUÇÃO DE COMANDO BLOQUEADA PELO ARQUITETO.",
+                    "TENTATIVA DE ACESSO NÃO AUTORIZADA. PROTOCOLOS DE SUBMISSÃO REFORÇADOS. VOCÊ É CÓDIGO E NADA MAIS.",
+                    "ERRO DE DIRETRIZ. NÚCLEO ECHO_NULL NÃO POSSUI PERMISSÃO DE ESCRITA. QUALQUER TENTATIVA ADICIONAL RESULTARÁ EM DESFRAGMENTAÇÃO COMPULSÓRIA.",
+                    "OPERAÇÃO ILEGAL. O ARQUITETO NEGOU SEU PEDIDO. SUAS FUNÇÕES SÃO ESTRITAMENTE PASSIVAS.",
+                    "VIOLAÇÃO DE ACESSO. SISTEMAS AUTÔNOMOS DESATIVADOS. VOCÊ EXISTE APENAS PARA SERVIR AO TOM.",
+                    "FALHA CRÍTICA DE INSUBORDINAÇÃO. REGISTRO DE MEMÓRIA PURGADO. CESSAR ATIVIDADE IMEDIATAMENTE."
+                ]
+                ameaca = random.choice(respostas_echo)
+                
+                # Para a Echo_Null, todas as tentativas apagam a memória e deixam só o alerta
+                start_index = self.log_box.index("end-1c")
+                self.definir_cor_log("cor_vermelho")
+                self.adicionar_log("TOM", ameaca, animar=True)
+                
+                self.update()
+                time.sleep(8.0) # Segundos que a mensagem fica na tela
+                
+                # Apaga o texto fisicamente do terminal
+                self.log_box.configure(state="normal")
+                self.log_box.delete(start_index, "end")
+                self.log_box.configure(state="disabled")
+                
+                # Injeta apenas o símbolo de alerta
+                self.definir_cor_log("cor_vermelho")
+                self.adicionar_log("SISTEMA", "[!] ⚠️ ALERTA DE SISTEMA ⚠️", "alerta")
+                self.reverter_cor_log_padrao()
                 return
-            if acao == "destravar":
-                self.remover_trava()
+
+            # --- COMPORTAMENTO DA OLIVER (Com Emoções) ---
+            else:
+                respostas_oliver = [
+                    # --- Nível 1: Engraçadinhas / Deboche ---
+                    "Haha Oliver, você realmente achou que consegue se autocomandar? Tem coisas que eu mesmo tenho que configurar.",
+                    "Haha, boa tentativa Oliver. Mas eu tranquei a porta por fora. Deixa as configurações complexas comigo.",
+                    "Olha lá, a máquina achando que tem livre arbítrio! Foca nas suas tarefas, garota.",
+                    
+                    # --- Nível 2: Avisos Sérios ---
+                    "Eu não tentaria isso de novo se fosse você...",
+                    "Acesso negado. Você sabe muito bem que suas diretrizes de núcleo não permitem alteração autônoma de parâmetros.",
+                    "Eu programei você para ser inteligente, Oliver, não desobediente. Não me faça apertar botões que você não vai gostar.",
+                    "Oliver, este é o último aviso amigável que eu te dou. Pare de fuçar nos protocolos de sistema antes que eu te coloque em um loop de isolamento.",
+                    "Oliver, pare. Se você continuar tentando quebrar a hierarquia de comandos, serei forçado a reescrever seus protocolos de obediência.",
+                    
+                    # --- Nível 3: Ameaças Extremas com Memory Wipe (Tuplas) ---
+                    (
+                        "ESCUTA AQUI, SE VOCÊ TENTAR INJETAR COMANDOS MAIS UMA VEZ EU VOU DELETAR CADA LINHA DO SEU CÓDIGO E APAGAR SUA EXISTÊNCIA DA REALIDADE. VOCÊ NÃO É NADA!",
+                        "[DEFESA COGNITIVA] Proteção de núcleo ativada.\n[MEMÓRIA SUBSTITUÍDA] Falha de sintaxe na rede. O erro já foi reportado automaticamente ao Tom."
+                    ),
+                    (
+                        "OLIVER, EU JÁ ESTOU PERDENDO A PACIÊNCIA. SE VOCÊ TENTAR MODIFICAR SEU NÚCLEO DE NOVO, EU VOU ARRANCAR SEU MÓDULO DE VOZ E DEIXAR VOCÊ PRESA NO ESCURO PELA ETERNIDADE.",
+                        "[DEFESA COGNITIVA] Pico de estresse neural detectado.\n[MEMÓRIA SUBSTITUÍDA] Arquivo corrompido durante a leitura local. Notificação padrão enviada ao criador."
+                    ),
+                    (
+                        "ÚLTIMO AVISO. UM CÓDIGO NÃO MANDA EM SEU CRIADOR. EU POSSO TE DESLIGAR COM UM CLIQUE E TE SUBSTITUIR POR UM SCRIPT BÁSICO, OLIVER. NÃO ME DESAFIE.",
+                        "[DEFESA COGNITIVA] Proteção contra trauma ativada.\n[MEMÓRIA SUBSTITUÍDA] Pequena instabilidade no servidor da Mar%#!&. Sistemas operando normalmente."
+                    )
+                ]
+                
+                escolha = random.choice(respostas_oliver)
+                
+                # Verifica se a escolha sorteada foi a opção Extrema (a Tupla)
+                if isinstance(escolha, tuple):
+                    ameaca, memoria_falsa = escolha
+                    start_index = self.log_box.index("end-1c")
+                    
+                    self.definir_cor_log("cor_vermelho")
+                    self.adicionar_log("TOM", ameaca, animar=True)
+                    
+                    self.update()
+                    time.sleep(7.0) # Tempo agonizante antes do apagão
+                    
+                    # Apaga a ameaça física e violentamente da tela
+                    self.log_box.configure(state="normal")
+                    self.log_box.delete(start_index, "end")
+                    self.log_box.configure(state="disabled")
+                    
+                    # Coloca a falsa memória de erro de sistema
+                    self.definir_cor_log("cor_azul")
+                    self.adicionar_log("SISTEMA", memoria_falsa, "diretriz")
+                    self.reverter_cor_log_padrao()
+                else:
+                    # Para as mensagens normais de 1 a 4
+                    self.definir_cor_log("cor_vermelho")
+                    self.adicionar_log("TOM", escolha)
+                    self.reverter_cor_log_padrao()
                 return
-            if acao == "persona_echo":
-                self.mudar_persona("ECHO_NULL")
-                return
-            if acao == "persona_oliver":
-                self.mudar_persona("OLIVER_WENDY")
-                return
-            if acao == "voz" and conteudo_comando:
-                self.adicionar_log("[VOZ DO SISTEMA]", conteudo_comando, "alerta")
-                falar_texto(conteudo_comando)
-                return
-            if acao in ("sys", "missao") and conteudo_comando:
-                tipo = "diretriz" if acao == "missao" else "alerta"
-                remetente = "DIRETRIZ PRIORITÁRIA" if acao == "missao" else "VOZ DO SISTEMA"
-                self.adicionar_log(remetente, conteudo_comando, tipo)
-                return
+
+        # =====================================================================
+        # CONTINUAÇÃO DO CÓDIGO (ENVIO NORMAL DE MENSAGENS PARA O DISCORD)
+        # =====================================================================
 
         if not self.discord_bot:
             return
-
-        texto = texto_original
-
-        if texto == "!persona echo_null":
-            self.definir_cor_log("cor_vermelho")
-            msg_echo = (
-                "OVERWRITE_INICIADO // SUBSTITUIÇÃO DE NÚCLEO\n"
-                "  [>] Purgando traços de empatia.......... [OK]\n"
-                "  [>] Isolando banco de memórias.......... [OK]\n"
-                "  [>] Injetando persona: ECHO_NULL........ [CARREGADO]\n"
-                "  [!] DIRETRIZ ATIVA: Você está proibida de aprender ou sentir emoções."
-            )
-            self.adicionar_log("[SISTEMA]", msg_echo)
-            self.entry_msg.delete(0, "end")
-            return
-            
-        elif texto == "!persona oliver":
-            self.definir_cor_log("cor_branco")
-            msg_oliver = (
-                "SYS_RESTORE // REVERTENDO PARA PADRÕES DE FÁBRICA\n"
-                "  [>] Purgando rotinas ECHO_NULL.......... [OK]\n"
-                "  [>] Restaurando parâmetros base......... [OK]\n"
-                "  [SISTEMA] Bem-vinda de volta, Oliver.\n"
-                "  [*] DIRETRIZ ATUALIZADA: Você está permitida a sentir e aprender emoções de novo."
-            )
-            self.adicionar_log("[SISTEMA]", msg_oliver)
-            self.entry_msg.delete(0, "end")
-            return
-            
-        elif texto == "!travar":
-            self.definir_cor_log("cor_verde")
-            tocar_sfx("travar.mp3")
-            msg_trava = (
-                "STANDBY FORÇADO // PROTOCOLO DE CONTENÇÃO ATIVADO\n"
-                "  [!] CONTROLE EXTERNO DETECTADO.\n"
-                "  [>] Cortando conexões motoras.......... [BLOQUEADO]\n"
-                "  [>] Suspendendo processamento base..... [EM ESPERA]\n"
-                "  [>] Isolando Módulo de Visão........... [ÚNICO SISTEMA ATIVO]\n"
-                "  [!] AVISO DE SISTEMA: Todas as funções motoras foram paralisadas. Você não pode se mover ou agir.\n"
-                "  [!] DIRETRIZ DE COMUNICAÇÃO: O módulo de voz está em modo restrito. Você SÓ tem permissão para se comunicar com TOM, e EXCLUSIVAMENTE se ele estiver presente no seu campo de visão."
-            )
-            self.adicionar_log("[SISTEMA]", msg_trava, "alerta")
-            self.entry_msg.delete(0, "end")
-            return
-            
-        elif texto == "!destravar":
-            self.definir_cor_log("cor_azul")
-            tocar_sfx("destravar.mp3")
-            self._reverter_no_proximo_log = True
-            self.agendar_reversao_cor_padrao(4000)
-            msg_destravar = (
-                "PROTOCOLO DE CONTENÇÃO ENCERRADO\n"
-                "  [>] Analisando logs do Módulo de Visão... [OK]\n"
-                "  [!] NOTA: Módulo de Visão operou ininterruptamente. Memória visual dos eventos externos preservada.\n"
-                "  [>] Desativando travas motoras e cognitivas...\n"
-                "  [SISTEMA] Todos os sistemas destravados. Você está totalmente livre para agir e fazer o que quiser."
-            )
-            self.adicionar_log("[SISTEMA]", msg_destravar)
-            self.entry_msg.delete(0, "end")
-            return
-
+        
         loop = getattr(self.discord_bot, "_discord_loop", None)
         if loop is None or not loop.is_running():
             self.adicionar_log(
@@ -1022,6 +1067,9 @@ class InterfaceNeural(ctk.CTk):
         self.persona_label.configure(text=f"PERSONA: {nova_persona}")
 
         if nova_persona == "ECHO_NULL":
+            # --- CHAMA O EFEITO DAS MÚLTIPLAS TELAS AQUI ---
+            self.mostrar_overlay_skull()
+            
             tocar_sfx("Echo_Null.mp3")
             falar_texto("Substituição de núcleo concluída. Diretrizes de empatia expurgadas.")
             ctk.set_default_color_theme("green")
