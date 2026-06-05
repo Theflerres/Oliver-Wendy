@@ -6,9 +6,13 @@ import time
 import os
 import sys
 import random
+import queue
 import sqlite3
 import shutil
 import tkinter as tk
+import tempfile
+import unicodedata
+import zipfile
 from datetime import datetime
 from tkinter import filedialog
 from dotenv import load_dotenv
@@ -70,6 +74,64 @@ def falar_texto(texto):
             print(f"[ERRO TTS] Falha ao reproduzir áudio: {type(e).__name__}: {e}")
 
     threading.Thread(target=_falar, daemon=True).start()
+
+
+tts_queue = queue.Queue()
+tts_worker_iniciado = False
+
+
+def criar_engine_tts_seguro():
+    if not TTS_IMPORT_OK:
+        return None
+    try:
+        engine = pyttsx3.init("sapi5") if os.name == "nt" else pyttsx3.init()
+        engine.setProperty("rate", 155)
+        voz_pt = None
+        for voz in engine.getProperty("voices"):
+            voz_desc = f"{(voz.name or '')} {(voz.id or '')}".lower()
+            if any(chave in voz_desc for chave in ("pt-br", "portuguese", "brazil", "brasil")):
+                voz_pt = voz.id
+                break
+        if voz_pt:
+            engine.setProperty("voice", voz_pt)
+        return engine
+    except Exception as e:
+        print(f"[TTS] Worker não conseguiu inicializar voz: {type(e).__name__}: {e}")
+        return None
+
+
+def worker_tts():
+    engine = criar_engine_tts_seguro()
+    while True:
+        conteudo = tts_queue.get()
+        if not conteudo:
+            continue
+        if engine is None:
+            engine = criar_engine_tts_seguro()
+        if engine is None:
+            continue
+        try:
+            engine.say(conteudo)
+            engine.runAndWait()
+        except Exception as e:
+            print(f"[ERRO TTS] Falha ao reproduzir áudio: {type(e).__name__}: {e}")
+            engine = None
+
+
+def iniciar_worker_tts():
+    global tts_worker_iniciado
+    if tts_worker_iniciado:
+        return
+    tts_worker_iniciado = True
+    threading.Thread(target=worker_tts, daemon=True).start()
+
+
+def falar_texto(texto):
+    conteudo = (texto or "").strip()
+    if not TTS_IMPORT_OK or not conteudo:
+        return
+    iniciar_worker_tts()
+    tts_queue.put(conteudo)
 
 # Importa o pygame para o áudio
 try:
@@ -230,16 +292,105 @@ def tocar_som_digitacao_aleatorio(event=None):
 
 
 # =====================================================================
+# INTERPRETADOR DE COMANDOS NATURAIS
+# =====================================================================
+def normalizar_texto(texto):
+    texto = (texto or "").strip().lower()
+    texto = unicodedata.normalize("NFD", texto)
+    texto = "".join(ch for ch in texto if unicodedata.category(ch) != "Mn")
+    return " ".join(texto.replace("_", " ").replace("-", " ").split())
+
+
+def _extrair_depois_de_gatilho(texto_original, gatilhos):
+    texto_norm = normalizar_texto(texto_original)
+    for gatilho in gatilhos:
+        gatilho_norm = normalizar_texto(gatilho)
+        pos = texto_norm.find(gatilho_norm)
+        if pos >= 0:
+            inicio = pos + len(gatilho_norm)
+            restante_norm = texto_norm[inicio:].lstrip(" :->")
+            if restante_norm:
+                return texto_original[-len(restante_norm):].strip(" :->")
+    return ""
+
+
+def interpretar_comando(texto):
+    original = (texto or "").strip()
+    norm = normalizar_texto(original)
+    if not norm:
+        return None, ""
+
+    if norm.startswith("!missao"):
+        return "missao", original[7:].strip()
+    if norm.startswith("!sys"):
+        return "sys", original[4:].strip()
+    if norm.startswith("!voz"):
+        return "voz", original[4:].strip()
+    if norm.startswith("!persona"):
+        if "echo" in norm or "null" in norm:
+            return "persona_echo", ""
+        if "oliver" in norm or "wendy" in norm:
+            return "persona_oliver", ""
+    if norm.startswith("!destravar") or norm.startswith("!liberar"):
+        return "destravar", ""
+    if norm.startswith("!trava") or norm.startswith("!bloquear"):
+        return "travar", ""
+
+    if any(frase in norm for frase in (
+        "destravar", "desbloquear", "liberar sistema", "liberar a oliver",
+        "restaurar controles", "encerrar contencao", "tirar do standby",
+    )):
+        return "destravar", ""
+
+    if any(frase in norm for frase in (
+        "travar", "bloquear sistema", "bloquear a oliver", "congelar sistema",
+        "ativar contencao", "modo standby", "colocar em standby",
+    )):
+        return "travar", ""
+
+    if ("echo null" in norm or "echo_null" in norm) and any(
+        palavra in norm for palavra in ("persona", "modo", "ativar", "trocar", "injetar")
+    ):
+        return "persona_echo", ""
+
+    if ("oliver" in norm or "wendy" in norm) and any(
+        frase in norm for frase in ("restaurar", "voltar", "persona", "modo", "reativar")
+    ):
+        return "persona_oliver", ""
+
+    conteudo = _extrair_depois_de_gatilho(original, (
+        "diga", "fale", "anuncie", "voz do sistema", "transmita em voz",
+    ))
+    if conteudo:
+        return "voz", conteudo
+
+    conteudo = _extrair_depois_de_gatilho(original, (
+        "mensagem do sistema", "alerta do sistema", "sistema avise", "sys",
+    ))
+    if conteudo:
+        return "sys", conteudo
+
+    conteudo = _extrair_depois_de_gatilho(original, (
+        "nova missão", "missão prioritária", "diretriz prioritária", "diretriz",
+    ))
+    if conteudo:
+        return "missao", conteudo
+
+    return None, ""
+
+
+# =====================================================================
 # TELA DE LOADING (BOOT DO SISTEMA)
 # =====================================================================
 def animacao_boot_terminal():
     tocar_sfx("ON FINAL.mp3")
 
     frames = []
-    if os.path.exists("html.txt"):
+    caminho_html = caminho_recurso_local("html.txt")
+    if os.path.exists(caminho_html):
         import re
         try:
-            with open("html.txt", "r", encoding="utf-8") as f:
+            with open(caminho_html, "r", encoding="utf-8") as f:
                 conteudo = f.read()
                 matches = re.findall(r"n\[\d+\]\s*=\s*'(.*?)';", conteudo, re.DOTALL)
                 for match in matches:
@@ -283,6 +434,7 @@ class InterfaceNeural(ctk.CTk):
         self.geometry("950x650")
         self.minsize(850, 550)
         self.resizable(True, True)
+        self.configure(fg_color="#06131f")
 
         self.persona_ativa = "OLIVER_WENDY"
         self.sistema_travado = False
@@ -298,19 +450,24 @@ class InterfaceNeural(ctk.CTk):
         self._after_reverter_cor_id = None
         self._reverter_no_proximo_log = False
 
+        self.bg_canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg="#06131f")
+        self.bg_canvas.grid(row=0, column=0, rowspan=2, columnspan=2, sticky="nsew")
+        self.bg_canvas.lower()
+        self._scanline_y = 0
+
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#071927")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="nsew")
 
-        self.logo_label = ctk.CTkLabel(self.sidebar, text="SISTEMA\nSCHROEDINGER", font=ctk.CTkFont(size=22, weight="bold"))
+        self.logo_label = ctk.CTkLabel(self.sidebar, text="SISTEMA\nSCHROEDINGER", font=ctk.CTkFont(size=22, weight="bold"), text_color="#8dfcff")
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        self.status_label = ctk.CTkLabel(self.sidebar, text="STATUS: CONECTANDO...", text_color="orange")
+        self.status_label = ctk.CTkLabel(self.sidebar, text="STATUS: CONECTANDO...", text_color="#ffb86b")
         self.status_label.grid(row=1, column=0, padx=20, pady=10)
 
-        self.persona_label = ctk.CTkLabel(self.sidebar, text="PERSONA: OLIVER WENDY", text_color="cyan")
+        self.persona_label = ctk.CTkLabel(self.sidebar, text="PERSONA: OLIVER WENDY", text_color="#64e3ff")
         self.persona_label.grid(row=2, column=0, padx=20, pady=10)
 
         self.btn_aprender = ctk.CTkButton(self.sidebar, text="Aprender Emoção", command=self.modal_aprender_emocao)
@@ -325,11 +482,19 @@ class InterfaceNeural(ctk.CTk):
         self.btn_historico_fotos = ctk.CTkButton(self.sidebar, text="Histórico de Fotos", command=self.abrir_historico_fotos)
         self.btn_historico_fotos.grid(row=6, column=0, padx=20, pady=10)
 
-        self.log_box = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="Consolas", size=15))
+        self.comandos_frame = ctk.CTkFrame(self.sidebar, fg_color="#0a2233", border_width=1, border_color="#134e66")
+        self.comandos_frame.grid(row=7, column=0, padx=16, pady=(18, 10), sticky="ew")
+        ctk.CTkLabel(self.comandos_frame, text="PROTOCOLOS", text_color="#66f7ff", font=ctk.CTkFont(size=12, weight="bold")).pack(padx=10, pady=(10, 6))
+        ctk.CTkButton(self.comandos_frame, text="TRAVAR", height=28, fg_color="#7d1b2a", hover_color="#a82438", command=self.acionar_trava).pack(fill="x", padx=10, pady=4)
+        ctk.CTkButton(self.comandos_frame, text="DESTRAVAR", height=28, fg_color="#0d6f5f", hover_color="#10977f", command=self.remover_trava).pack(fill="x", padx=10, pady=4)
+        ctk.CTkButton(self.comandos_frame, text="ECHO_NULL", height=28, fg_color="#334d22", hover_color="#4b702d", command=lambda: self.mudar_persona("ECHO_NULL")).pack(fill="x", padx=10, pady=4)
+        ctk.CTkButton(self.comandos_frame, text="OLIVER", height=28, fg_color="#174f83", hover_color="#1f6caf", command=lambda: self.mudar_persona("OLIVER_WENDY")).pack(fill="x", padx=10, pady=(4, 10))
+
+        self.log_box = ctk.CTkTextbox(self, state="disabled", font=ctk.CTkFont(family="Consolas", size=15), fg_color="#071522", border_width=1, border_color="#1f7894", text_color="#dffcff")
         self.log_box.grid(row=0, column=1, padx=20, pady=(20, 0), sticky="nsew")
         self.configurar_tags_cores_log()
 
-        self.input_frame = ctk.CTkFrame(self)
+        self.input_frame = ctk.CTkFrame(self, fg_color="#081b2a", border_width=1, border_color="#174e67")
         self.input_frame.grid(row=1, column=1, padx=20, pady=20, sticky="ew")
         self.input_frame.grid_columnconfigure(0, weight=1)
         self.input_frame.grid_columnconfigure(2, weight=0)
@@ -343,12 +508,12 @@ class InterfaceNeural(ctk.CTk):
         )
         self.lbl_foto_engatilhada.grid(row=0, column=0, columnspan=4, padx=(10, 10), pady=(8, 2), sticky="ew")
 
-        self.entry_msg = ctk.CTkEntry(self.input_frame, placeholder_text="Transmitir dados neurais para Tom...")
+        self.entry_msg = ctk.CTkEntry(self.input_frame, placeholder_text="Transmitir dados neurais para Tom...", fg_color="#05111c", border_color="#2f8baa", text_color="#e8fdff")
         self.entry_msg.grid(row=1, column=0, padx=(10, 8), pady=(2, 10), sticky="ew")
         self.entry_msg.bind("<Return>", self.enviar_para_tom)
         self.entry_msg.bind("<Key>", tocar_som_digitacao_aleatorio)
 
-        self.btn_anexar = ctk.CTkButton(self.input_frame, text="Anexar", width=90, command=self.toggle_menu_anexo)
+        self.btn_anexar = ctk.CTkButton(self.input_frame, text="Anexar", width=90, command=self.toggle_menu_anexo, fg_color="#155f88", hover_color="#1b7eb5")
         self.btn_anexar.grid(row=1, column=1, padx=(0, 8), pady=(2, 10))
 
         self.combo_fotos = ctk.CTkComboBox(
@@ -362,10 +527,10 @@ class InterfaceNeural(ctk.CTk):
         self.combo_fotos.grid(row=1, column=2, padx=(0, 8), pady=(2, 10))
         self.combo_fotos.grid_remove()
 
-        self.btn_enviar = ctk.CTkButton(self.input_frame, text="ENVIAR", width=80, command=self.enviar_para_tom)
+        self.btn_enviar = ctk.CTkButton(self.input_frame, text="ENVIAR", width=80, command=self.enviar_para_tom, fg_color="#0b8d77", hover_color="#10aa90")
         self.btn_enviar.grid(row=1, column=3, padx=(0, 10), pady=(2, 10))
 
-        self.frame_preview_anexo = ctk.CTkFrame(self.input_frame)
+        self.frame_preview_anexo = ctk.CTkFrame(self.input_frame, fg_color="#061521", border_width=1, border_color="#123a4e")
         self.frame_preview_anexo.grid(row=2, column=0, columnspan=4, padx=(10, 10), pady=(0, 10), sticky="ew")
         self.frame_preview_anexo.grid_columnconfigure(1, weight=1)
 
@@ -376,8 +541,86 @@ class InterfaceNeural(ctk.CTk):
         self.lbl_preview_imagem.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="w")
 
         self.bind("<Button-1>", lambda e: tocar_sfx("MouseClick.mp3"))
+        self.bind("<Configure>", self.desenhar_blueprint)
 
         self.adicionar_log("[BOOT]", "Sistemas Visuais Online. Aguardando conexão neural...")
+
+        self.desenhar_blueprint()
+        self.animar_blueprint()
+        self.after(300, self.mostrar_splash_boot)
+
+    def desenhar_blueprint(self, event=None):
+        if not hasattr(self, "bg_canvas"):
+            return
+        largura = max(self.winfo_width(), 950)
+        altura = max(self.winfo_height(), 650)
+        self.bg_canvas.delete("blueprint")
+
+        for x in range(0, largura + 1, 48):
+            cor = "#0b2b3e" if x % 96 else "#123f57"
+            self.bg_canvas.create_line(x, 0, x, altura, fill=cor, tags="blueprint")
+        for y in range(0, altura + 1, 48):
+            cor = "#0b2b3e" if y % 96 else "#123f57"
+            self.bg_canvas.create_line(0, y, largura, y, fill=cor, tags="blueprint")
+
+        self.bg_canvas.create_oval(largura - 260, 40, largura - 60, 240, outline="#1d6c84", width=1, tags="blueprint")
+        self.bg_canvas.create_rectangle(250, altura - 190, 520, altura - 70, outline="#1d6c84", width=1, tags="blueprint")
+        self.bg_canvas.create_line(250, altura - 190, 520, altura - 70, fill="#134e66", tags="blueprint")
+        self.bg_canvas.create_text(largura - 160, 262, text="NEURAL LINK", fill="#1e7f9a", font=("Consolas", 10), tags="blueprint")
+
+    def animar_blueprint(self):
+        if not hasattr(self, "bg_canvas"):
+            return
+        largura = max(self.winfo_width(), 950)
+        altura = max(self.winfo_height(), 650)
+        self.bg_canvas.delete("scanline")
+        self._scanline_y = (self._scanline_y + 3) % max(altura, 1)
+        self.bg_canvas.create_line(0, self._scanline_y, largura, self._scanline_y, fill="#2bf7ff", width=1, tags="scanline")
+        self.bg_canvas.create_line(0, self._scanline_y + 18, largura, self._scanline_y + 18, fill="#0d5268", width=1, tags="scanline")
+        self.after(45, self.animar_blueprint)
+
+    def mostrar_splash_boot(self):
+        splash = ctk.CTkToplevel(self)
+        splash.title("BOOT")
+        splash.geometry("620x360")
+        splash.resizable(False, False)
+        splash.configure(fg_color="#030b12")
+        splash.transient(self)
+        splash.grab_set()
+
+        frame = ctk.CTkFrame(splash, fg_color="#061521", border_width=1, border_color="#2bf7ff")
+        frame.pack(fill="both", expand=True, padx=18, pady=18)
+        titulo = ctk.CTkLabel(frame, text="SCHROEDINGER CORE", text_color="#8dfcff", font=ctk.CTkFont(size=24, weight="bold"))
+        titulo.pack(pady=(28, 8))
+        status = ctk.CTkLabel(frame, text="Inicializando matriz neural...", text_color="#dffcff", font=ctk.CTkFont(family="Consolas", size=14))
+        status.pack(pady=8)
+        barra = ctk.CTkProgressBar(frame, width=460, progress_color="#2bf7ff")
+        barra.pack(pady=18)
+        barra.set(0)
+        linhas = ctk.CTkLabel(frame, text="", text_color="#66f7ff", font=ctk.CTkFont(family="Consolas", size=12), justify="left")
+        linhas.pack(padx=30, pady=8, anchor="w")
+
+        etapas = [
+            "carregando memória local",
+            "sincronizando áudio",
+            "abrindo canal neural",
+            "validando protocolos",
+            "interface online",
+        ]
+
+        def passo(i=0):
+            if not splash.winfo_exists():
+                return
+            progresso = min((i + 1) / len(etapas), 1)
+            barra.set(progresso)
+            linhas.configure(text="\n".join(f"[OK] {etapa}" for etapa in etapas[:i + 1]))
+            if i + 1 < len(etapas):
+                splash.after(420, lambda: passo(i + 1))
+            else:
+                status.configure(text="Núcleo ativo.")
+                splash.after(650, splash.destroy)
+
+        passo()
 
     def configurar_tags_cores_log(self):
         self.log_box.tag_config("cor_branco", foreground="#FFFFFF")
@@ -566,6 +809,7 @@ class InterfaceNeural(ctk.CTk):
         texto = (self.entry_msg.get() or "").strip()
         if not texto:
             return
+        texto_original = texto
 
         if getattr(self, "aguardando_resposta_update", False):
             texto_lower = texto.lower()
@@ -593,10 +837,35 @@ class InterfaceNeural(ctk.CTk):
                 self.entry_msg.delete(0, "end")
                 return
 
+        acao, conteudo_comando = interpretar_comando(texto_original)
+        if acao:
+            self.entry_msg.delete(0, "end")
+            if acao == "travar":
+                self.acionar_trava()
+                return
+            if acao == "destravar":
+                self.remover_trava()
+                return
+            if acao == "persona_echo":
+                self.mudar_persona("ECHO_NULL")
+                return
+            if acao == "persona_oliver":
+                self.mudar_persona("OLIVER_WENDY")
+                return
+            if acao == "voz" and conteudo_comando:
+                self.adicionar_log("[VOZ DO SISTEMA]", conteudo_comando, "alerta")
+                falar_texto(conteudo_comando)
+                return
+            if acao in ("sys", "missao") and conteudo_comando:
+                tipo = "diretriz" if acao == "missao" else "alerta"
+                remetente = "DIRETRIZ PRIORITÁRIA" if acao == "missao" else "VOZ DO SISTEMA"
+                self.adicionar_log(remetente, conteudo_comando, tipo)
+                return
+
         if not self.discord_bot:
             return
 
-        texto = texto.lower()
+        texto = texto_original
 
         if texto == "!persona echo_null":
             self.definir_cor_log("cor_vermelho")
@@ -943,6 +1212,73 @@ class InterfaceNeural(ctk.CTk):
                 command=lambda r=registro: exibir_foto(r)
             ).pack(fill="x", padx=6, pady=4)
 
+    def aplicar_atualizacao_automatica(self):
+        zip_update = os.path.abspath("atualizacao_oliver.zip")
+        if not os.path.exists(zip_update):
+            self.adicionar_log("[SYS_UPDATE]", "Pacote de atualização não encontrado.", "alerta")
+            return
+
+        memoria_dir = os.path.abspath(PASTA_MEMORIA)
+        staging_dir = os.path.join(memoria_dir, "update_staging")
+        backup_dir = os.path.join(memoria_dir, "backups", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        app_dir = os.path.abspath(os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else BASE_DIR)
+
+        try:
+            if os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir)
+            os.makedirs(staging_dir, exist_ok=True)
+            os.makedirs(backup_dir, exist_ok=True)
+
+            with zipfile.ZipFile(zip_update, "r") as pacote:
+                for info in pacote.infolist():
+                    destino = os.path.abspath(os.path.join(staging_dir, info.filename))
+                    if not destino.startswith(os.path.abspath(staging_dir)):
+                        raise RuntimeError("Pacote de atualização contém caminho inválido.")
+                pacote.extractall(staging_dir)
+
+            self.adicionar_log("[SYS_UPDATE]", f"Pacote validado. Backup em: {backup_dir}", "alerta")
+
+            for raiz, _, arquivos in os.walk(staging_dir):
+                for nome in arquivos:
+                    origem = os.path.join(raiz, nome)
+                    relativo = os.path.relpath(origem, staging_dir)
+                    if relativo.startswith("Memoria_Sistema") or relativo == ".env":
+                        continue
+                    destino = os.path.join(app_dir, relativo)
+                    if os.path.exists(destino):
+                        destino_backup = os.path.join(backup_dir, relativo)
+                        os.makedirs(os.path.dirname(destino_backup), exist_ok=True)
+                        shutil.copy2(destino, destino_backup)
+
+            if getattr(sys, "frozen", False):
+                bat_path = os.path.join(tempfile.gettempdir(), "oliver_update_apply.bat")
+                with open(bat_path, "w", encoding="utf-8") as bat:
+                    bat.write("@echo off\n")
+                    bat.write("timeout /t 2 /nobreak >nul\n")
+                    bat.write(f'xcopy "{staging_dir}" "{app_dir}" /E /Y /I >nul\n')
+                    bat.write(f'start "" "{sys.executable}"\n')
+                    bat.write("del \"%~f0\"\n")
+                self.adicionar_log("[SYS_UPDATE]", "Atualização preparada. Reiniciando núcleo pelo aplicador externo...", "alerta")
+                os.startfile(bat_path)
+                self.after(800, self.destroy)
+                return
+
+            for raiz, _, arquivos in os.walk(staging_dir):
+                for nome in arquivos:
+                    origem = os.path.join(raiz, nome)
+                    relativo = os.path.relpath(origem, staging_dir)
+                    if relativo.startswith("Memoria_Sistema") or relativo == ".env":
+                        continue
+                    destino = os.path.join(app_dir, relativo)
+                    os.makedirs(os.path.dirname(destino), exist_ok=True)
+                    shutil.copy2(origem, destino)
+
+            self.adicionar_log("[SYS_UPDATE]", "Atualização aplicada. Reiniciando interface...", "alerta")
+            self.after(1000, lambda: os.execv(sys.executable, [sys.executable] + sys.argv))
+
+        except Exception as e:
+            self.adicionar_log("[SYS_UPDATE]", f"Falha ao aplicar atualização: {e}", "alerta")
+
 
 # =====================================================================
 # MOTOR DISCORD
@@ -970,8 +1306,35 @@ class MotorDiscord(discord.Client):
         if isinstance(message.channel, discord.DMChannel):
             if message.author.id == ID_DO_TOM_SCHROEDINGER:
                 texto = message.content
+                acao, conteudo_comando = interpretar_comando(texto)
 
-                if texto.startswith("!missao"):
+                if acao == "missao" and conteudo_comando:
+                    tocar_sfx("NotificaÃ§Ã£o.mp3")
+                    self.ui.after(0, self.ui.adicionar_log, "DIRETRIZ PRIORITÁRIA RECEBIDA", conteudo_comando, "diretriz")
+
+                elif acao == "sys" and conteudo_comando:
+                    tocar_sfx("NotificaÃ§Ã£o.mp3")
+                    self.ui.after(0, self.ui.adicionar_log, "VOZ DO SISTEMA", conteudo_comando, "alerta")
+
+                elif acao == "voz" and conteudo_comando:
+                    self.ui.after(0, self.ui.adicionar_log, "[VOZ DO SISTEMA]", conteudo_comando, "alerta")
+                    falar_texto(conteudo_comando)
+
+                elif acao == "travar":
+                    self.ui.after(0, self.ui.acionar_trava)
+
+                elif acao == "destravar":
+                    self.ui.after(0, self.ui.remover_trava)
+
+                elif acao == "persona_echo":
+                    self.ui.after(0, self.ui.mudar_persona, "ECHO_NULL")
+                    await message.channel.send("[SISTEMA] ECHO_NULL Ativada.")
+
+                elif acao == "persona_oliver":
+                    self.ui.after(0, self.ui.mudar_persona, "OLIVER_WENDY")
+                    await message.channel.send("[SISTEMA] Oliver Ativada.")
+
+                elif texto.startswith("!missao"):
                     conteudo = texto.replace("!missao", "").strip()
                     tocar_sfx("Notificação.mp3")
                     self.ui.after(0, self.ui.adicionar_log, "DIRETRIZ PRIORITÁRIA RECEBIDA", conteudo, "diretriz")
